@@ -102,11 +102,19 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Vercel routes /api/foo/bar → this fn with req.url = "/api/foo/bar".
-    // We strip the leading "/api" so /api/v1/x → overchat /v1/x.
-    let path = req.url || "/";
+    // Vercel routes /api/foo/bar → this fn with req.url = "/api/foo/bar?path=foo/bar".
+    // Split off the query, strip the "/api" prefix, and drop the synthetic
+    // `path=` param that Vercel adds from the catch-all.
+    const raw = req.url || "/";
+    const qIdx = raw.indexOf("?");
+    let path = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
+    const rawQuery = qIdx >= 0 ? raw.slice(qIdx + 1) : "";
     if (path.startsWith("/api/")) path = path.slice(4);
     else if (path === "/api") path = "/";
+    const params = new URLSearchParams(rawQuery);
+    params.delete("path");
+    const query = params.toString();
+    const suffix = query ? `?${query}` : "";
 
     if (path === "/" || path === "/healthz") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -122,7 +130,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    const url = UPSTREAM + path;
+    const url = UPSTREAM + path + suffix;
     const deviceUuid = req.headers["x-device-uuid"] || randomUUID();
     const headers = browserHeaders(deviceUuid, req.headers["content-type"], req.headers["accept"]);
 
