@@ -1,0 +1,10 @@
+{
+  "name": "hybra-overchat-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "20.x" },
+  "dependencies": {
+    "undici": "^6.19.8"
+  }
+}

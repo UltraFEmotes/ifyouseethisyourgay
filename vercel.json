@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/[...path].mjs": {
+      "maxDuration": 30
+    }
+  }
+}
