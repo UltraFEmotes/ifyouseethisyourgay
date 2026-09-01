@@ -92,6 +92,229 @@ async function fetchViaProxy(url, opts, proxy) {
   }
 }
 
+const USEAI_API = "https://api.use.ai/v1";
+const USEAI_ORIGIN = "https://use.ai";
+const USEAI_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+function useaiHeaders(extra = {}) {
+  return {
+    "User-Agent": USEAI_UA,
+    Origin: USEAI_ORIGIN,
+    Referer: USEAI_ORIGIN + "/",
+    "Content-Type": "application/json",
+    Accept: "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    ...extra,
+  };
+}
+
+function proxyDispatcher(proxy) {
+  return proxy
+    ? new ProxyAgent({ uri: proxy.url, requestTls: { rejectUnauthorized: true } })
+    : DIRECT;
+}
+
+function cookieFrom(res, name) {
+  let cookies = [];
+  try {
+    cookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+  } catch {
+    cookies = [];
+  }
+  for (const raw of cookies) {
+    const eq = raw.indexOf("=");
+    if (eq < 0) continue;
+    if (raw.slice(0, eq).trim() === name) return raw.slice(eq + 1).split(";")[0].trim();
+  }
+  return "";
+}
+
+async function jsonBody(res) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// Full credentials sign-in flow on ONE circuit: use.ai auto-registers the
+// email on first sign-in; the session cookie then mints worker + app tokens.
+async function registerUseAIAccountOnProxy(email, password, proxy) {
+  const dispatcher = proxyDispatcher(proxy);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
+  try {
+    const headers = useaiHeaders();
+    const signIn = await undiciFetch(`${USEAI_API}/auth/sign-in/credentials`, {
+      method: "POST",
+      headers,
+      dispatcher,
+      signal: controller.signal,
+      body: JSON.stringify({ email, password, turnstileBypass: true }),
+      redirect: "manual",
+    });
+    if (signIn.status !== 200) {
+      const text = await signIn.text().catch(() => "");
+      const err = new Error(`sign-in failed: HTTP ${signIn.status} ${text.slice(0, 160)}`);
+      err.status = signIn.status;
+      throw err;
+    }
+    const data = await jsonBody(signIn);
+    if (!data || !data.ok) {
+      throw new Error(`sign-in not ok: ${JSON.stringify(data).slice(0, 160)}`);
+    }
+    const userId = String(data.userId ?? data.user?.id ?? data.user_id ?? "");
+    if (!userId) {
+      throw new Error(`sign-in returned no userId: ${JSON.stringify(data).slice(0, 160)}`);
+    }
+    const sessionToken = cookieFrom(signIn, "__Secure-better-auth.session_token");
+    const authed = sessionToken
+      ? { ...headers, Cookie: `__Secure-better-auth.session_token=${sessionToken}` }
+      : headers;
+
+    const tokRes = await undiciFetch(`${USEAI_API}/auth/token`, {
+      headers: authed,
+      dispatcher,
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    const workerToken = tokRes.status === 200 ? String((await jsonBody(tokRes))?.token ?? "") : "";
+
+    const attRes = await undiciFetch(`${USEAI_API}/auth/app-attestation`, {
+      method: "POST",
+      headers: authed,
+      dispatcher,
+      signal: controller.signal,
+      body: "{}",
+      redirect: "manual",
+    });
+    const appToken = attRes.status === 200 ? String((await jsonBody(attRes))?.token ?? "") : "";
+
+    if (!workerToken || !appToken) {
+      throw new Error("missing worker/app token after sign-in");
+    }
+    return {
+      email,
+      password,
+      userId,
+      userType: "regular",
+      workerToken,
+      appToken,
+      sessionToken,
+      createdAt: Math.floor(Date.now() / 1000),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshUseAIAccountOnProxy(sessionToken, proxy) {
+  const dispatcher = proxyDispatcher(proxy);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
+  try {
+    const headers = useaiHeaders({
+      Cookie: `__Secure-better-auth.session_token=${sessionToken}`,
+    });
+    const tokRes = await undiciFetch(`${USEAI_API}/auth/token`, {
+      headers,
+      dispatcher,
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    const workerToken = tokRes.status === 200 ? String((await jsonBody(tokRes))?.token ?? "") : "";
+    const attRes = await undiciFetch(`${USEAI_API}/auth/app-attestation`, {
+      method: "POST",
+      headers,
+      dispatcher,
+      signal: controller.signal,
+      body: "{}",
+      redirect: "manual",
+    });
+    const appToken = attRes.status === 200 ? String((await jsonBody(attRes))?.token ?? "") : "";
+    if (!workerToken || !appToken) throw new Error("refresh: missing worker/app token");
+    return { workerToken, appToken };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function relayKeyOk(req) {
+  const relayKey = process.env.RELAY_KEY || "";
+  if (!relayKey) return true;
+  return (req.headers["x-relay-key"] || "") === relayKey;
+}
+
+async function handleUseAIRegister(res, req) {
+  if (!relayKeyOk(req)) {
+    res.writeHead(401, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ error: { message: "bad relay key" } }));
+    return;
+  }
+  const body = JSON.parse((await readBody(req)).toString() || "{}");
+  if (!body.email || !body.password) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "email + password required" } }));
+    return;
+  }
+  const tries = Math.max(1, Math.min(8, body.proxyTries || 6));
+  let lastErr = null;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    const proxy = pickProxy();
+    try {
+      const account = await registerUseAIAccountOnProxy(body.email, body.password, proxy);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ ok: true, via: proxy ? proxy.label : "direct", account }));
+      return;
+    } catch (err) {
+      lastErr = err;
+      const low = String(err?.message ?? err).toLowerCase();
+      const retryable = /429|403|connect|reset|closed|abort|timeout|refused/i.test(low);
+      if (proxy && retryable) proxy.dead = true;
+      if (!retryable) break;
+    }
+  }
+  res.writeHead(502, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify({ ok: false, error: { message: String(lastErr?.message ?? lastErr) } }));
+}
+
+async function handleUseAIRefresh(res, req) {
+  if (!relayKeyOk(req)) {
+    res.writeHead(401, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ error: { message: "bad relay key" } }));
+    return;
+  }
+  const body = JSON.parse((await readBody(req)).toString() || "{}");
+  if (!body.sessionToken) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "sessionToken required" } }));
+    return;
+  }
+  const tries = Math.max(1, Math.min(6, body.proxyTries || 4));
+  let lastErr = null;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    const proxy = pickProxy();
+    try {
+      const tokens = await refreshUseAIAccountOnProxy(body.sessionToken, proxy);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ ok: true, via: proxy ? proxy.label : "direct", ...tokens }));
+      return;
+    } catch (err) {
+      lastErr = err;
+      const low = String(err?.message ?? err).toLowerCase();
+      const retryable = /429|403|connect|reset|closed|abort|timeout|refused/i.test(low);
+      if (proxy && retryable) proxy.dead = true;
+      if (!retryable) break;
+    }
+  }
+  res.writeHead(502, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify({ ok: false, error: { message: String(lastErr?.message ?? lastErr) } }));
+}
+
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") {
@@ -130,6 +353,16 @@ export default async function handler(req, res) {
           proxies_alive: alive,
         }),
       );
+      return;
+    }
+
+    // use.ai account farm (rotating exit IP per registration).
+    if (path === "/useai-register" && req.method === "POST") {
+      await handleUseAIRegister(res, req);
+      return;
+    }
+    if (path === "/useai-refresh" && req.method === "POST") {
+      await handleUseAIRefresh(res, req);
       return;
     }
 
